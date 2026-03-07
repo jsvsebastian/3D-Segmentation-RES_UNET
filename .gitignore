@@ -1,0 +1,9 @@
+data/
+processed/
+tesisEnv/
+__pycache__/
+*.pth
+*.h5
+.ipynb_checkpoints/
+runs/
+docs/

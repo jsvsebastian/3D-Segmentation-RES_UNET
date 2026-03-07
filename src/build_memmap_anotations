@@ -1,0 +1,138 @@
+import os
+import json
+import numpy as np
+import SimpleITK as sitk
+from tqdm import tqdm
+
+# ============================================================
+# CONFIGURACIÓN
+# ============================================================
+TARGET_SPACING = (0.4, 0.4, 0.6)
+
+ASOCA_TYPES = {
+    "Diseased": {
+        "annotations": "/media/mrsmile/IA/tesis/data/dataset/asoca/CompressedVersion/Diseased/Annotations",
+        "n_cases": 20
+    },
+    "Normal": {
+        "annotations": "/media/mrsmile/IA/tesis/data/dataset/asoca/CompressedVersion/Normal/Annotations",
+        "n_cases": 20
+    }
+}
+
+OUT_VOL  = "/media/mrsmile/IA/tesis/data/processed/memmap/masks"
+OUT_META = "/media/mrsmile/IA/tesis/data/processed/memmap/masks_meta"
+os.makedirs(OUT_VOL,  exist_ok=True)
+os.makedirs(OUT_META, exist_ok=True)
+
+# ============================================================
+# FUNCIÓN DE RESAMPLEO — vecino más cercano para máscaras
+# ============================================================
+def resample_mask(mask_sitk, target_spacing):
+    original_spacing = mask_sitk.GetSpacing()
+    original_size    = mask_sitk.GetSize()
+
+    new_size = [
+        int(round(original_size[i] * original_spacing[i] / target_spacing[i]))
+        for i in range(3)
+    ]
+
+    resampler = sitk.ResampleImageFilter()
+    resampler.SetOutputSpacing(target_spacing)
+    resampler.SetSize(new_size)
+    resampler.SetOutputDirection(mask_sitk.GetDirection())
+    resampler.SetOutputOrigin(mask_sitk.GetOrigin())
+    resampler.SetTransform(sitk.Transform())
+    resampler.SetDefaultPixelValue(0)
+    resampler.SetInterpolator(sitk.sitkNearestNeighbor)
+
+    return resampler.Execute(mask_sitk)
+
+# ============================================================
+# PIPELINE
+# ============================================================
+errores = []
+
+for asoca_type, cfg in ASOCA_TYPES.items():
+    ann_dir = cfg["annotations"]
+    n       = cfg["n_cases"]
+
+    for i in tqdm(range(1, n + 1), desc=f"{asoca_type}"):
+        name     = f"{asoca_type}_{i}"
+        ann_path = os.path.join(ann_dir, f"{name}.nrrd")
+
+        if not os.path.exists(ann_path):
+            print(f"⚠️  No encontrado: {ann_path}")
+            errores.append(name)
+            continue
+
+        try:
+            # Leer máscara original
+            mask = sitk.ReadImage(ann_path)
+
+            # Resamplear con vecino más cercano
+            mask_resampled = resample_mask(mask, TARGET_SPACING)
+
+            # Convertir a numpy float32
+            arr = sitk.GetArrayFromImage(mask_resampled).astype(np.float32)
+
+            # Verificar que sigue siendo binaria
+            unique_vals = np.unique(arr)
+            assert set(unique_vals).issubset({0.0, 1.0}), \
+                f"Valores no binarios: {unique_vals}"
+
+            # Nombre consistente con los volúmenes procesados
+            out_name = f"asoca_{name.lower()}"
+
+            # Guardar memmap
+            mmap = np.memmap(
+                os.path.join(OUT_VOL, f"{out_name}.dat"),
+                dtype='float32', mode='w+', shape=arr.shape
+            )
+            mmap[:] = arr[:]
+            mmap.flush()
+            del mmap
+
+            # Guardar metadata
+            meta = {
+                "shape":     [int(s) for s in arr.shape],
+                "dtype":     "float32",
+                "spacing":   list(TARGET_SPACING),
+                "origin":    [float(v) for v in mask_resampled.GetOrigin()],
+                "direction": [float(v) for v in mask_resampled.GetDirection()]
+            }
+            with open(os.path.join(OUT_META, f"{out_name}.json"), 'w') as f:
+                json.dump(meta, f, indent=2)
+
+        except Exception as e:
+            print(f"❌ Error en {name}: {e}")
+            errores.append(name)
+
+# ============================================================
+# RESUMEN
+# ============================================================
+print(f"\n✅ Conversión completada")
+print(f"   Procesados: {40 - len(errores)}/40")
+if errores:
+    print(f"   Errores: {errores}")
+
+# ============================================================
+# VERIFICACIÓN RÁPIDA
+# ============================================================
+print("\n--- VERIFICACIÓN ---")
+for sample in ["asoca_diseased_1", "asoca_normal_1"]:
+    meta_path = os.path.join(OUT_META, f"{sample}.json")
+    if not os.path.exists(meta_path):
+        continue
+    with open(meta_path) as f:
+        meta = json.load(f)
+    mmap = np.memmap(
+        os.path.join(OUT_VOL, f"{sample}.dat"),
+        dtype='float32', mode='r', shape=tuple(meta['shape'])
+    )
+    pct = 100 * mmap.sum() / mmap.size
+    print(f"{sample}:")
+    print(f"  Shape:              {mmap.shape}")
+    print(f"  Valores únicos:     {np.unique(mmap)}")
+    print(f"  % voxels coronarios: {pct:.3f}%")
+    del mmap
